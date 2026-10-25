@@ -60,6 +60,7 @@ class Span:
     y1: float
     ox: float
     oy: float
+    frag: bool = False     # first span of a piece that was joined onto the line
 
 
 @dataclass
@@ -126,6 +127,17 @@ def _is_bullet_char(c: str, font: str = "") -> bool:
 _BULLET_STRIP = re.compile(r"^\s*[%s\ue000-\uf8ff]\s*" % re.escape("".join(BULLET_CHARS | DASH_BULLETS)))
 
 
+def _join_spans(spans):
+    out = ""
+    for i, sp in enumerate(spans):
+        t = sp.text
+        if i and out and not out[-1].isspace() and not t[:1].isspace():
+            if sp.frag or sp.x0 - spans[i - 1].x1 > 0.12 * max(sp.size, 6):
+                out += " "
+        out += t
+    return out
+
+
 def _norm_space(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
@@ -138,7 +150,7 @@ def _make_line(ld, body_size):
         x0, y0, x1, y1 = s["bbox"]
         ox, oy = s["origin"]
         spans.append(Span(s["text"], s["font"], s["size"], s["flags"], s["color"],
-                          x0, y0, x1, y1, ox, oy))
+                          x0, y0, x1, y1, ox, oy, bool(s.get("_frag"))))
     if not spans:
         return None
     dx, dy = ld.get("dir", (1, 0))
@@ -164,7 +176,7 @@ def _make_line(ld, body_size):
         has_label = True
 
     edit_spans = spans[lead:]
-    text = "".join(sp.text for sp in edit_spans)
+    text = _join_spans(edit_spans)
     x_bullet = spans[0].ox
     if bullet == "merged":
         text = _BULLET_STRIP.sub("", text)
@@ -179,7 +191,7 @@ def _make_line(ld, body_size):
 
     size = max(sp.size for sp in spans)
     bold_all = all(sp.flags & 16 for sp in spans)
-    plain = _norm_space("".join(sp.text for sp in spans))
+    plain = _norm_space(_join_spans(spans))
     letters = re.sub(r"[^A-Za-z]", "", plain)
     heading = False
     if not bullet and 3 <= len(plain) <= 50:
@@ -270,6 +282,48 @@ def _assign_limits(page, block_lines):
         ln.limit = max(lim, ln.x_text + 20)
 
 
+def _merge_fragments(blocks):
+    """Some PDFs split one visual line into several pieces (slightly different baselines).
+    Join pieces that sit on the same baseline and are only a word-space apart."""
+    lines = [ld for b in blocks for ld in b["lines"] if ld["spans"]]
+
+    def info(ld):
+        sp = [x for x in ld["spans"] if x["text"].strip()]
+        if not sp or abs(ld.get("dir", (1, 0))[1]) > 0.2:
+            return None
+        return (sp[0]["origin"][1], sp[0]["bbox"][0], max(x["bbox"][2] for x in sp),
+                max(x["size"] for x in sp))
+
+    changed = True
+    while changed:
+        changed = False
+        for a in lines:
+            ia = info(a)
+            if not a["spans"] or ia is None:
+                continue
+            best = None
+            for c in lines:
+                if c is a or not c["spans"]:
+                    continue
+                ic = info(c)
+                if ic is None:
+                    continue
+                gap = ic[1] - ia[2]
+                if abs(ic[0] - ia[0]) <= 0.4 * ia[3] and -1.0 <= gap <= 0.9 * ia[3]:
+                    if best is None or gap < best[0]:
+                        best = (gap, c)
+            if best:
+                for x in best[1]["spans"]:
+                    if x["text"].strip():
+                        x["_frag"] = True
+                        break
+                a["spans"] = a["spans"] + best[1]["spans"]
+                best[1]["spans"] = []
+                changed = True
+    for b in blocks:
+        b["lines"] = [ld for ld in b["lines"] if ld["spans"]]
+
+
 def _dominant(lines):
     c = Counter()
     for ln in lines:
@@ -305,6 +359,7 @@ def analyze_pdf(pdf_bytes: bytes) -> ResumeDoc:
         data = page.get_text("dict")
         blocks = [b for b in data["blocks"] if b.get("type") == 0]
         _merge_bullet_lines(blocks)
+        _merge_fragments(blocks)
 
         # body font size = most common size, weighted by characters
         sizes = Counter()
@@ -385,7 +440,8 @@ def analyze_pdf(pdf_bytes: bytes) -> ResumeDoc:
                            (PHONE_RE.search(full) and len(full) < 80))
 
             kind, editable = "frozen", False
-            if not (is_heading or tabbed or overlaps_link or contact or mode == "frozen"):
+            piped = ptext.count("|") >= 2 or ptext.count(" | ") >= 1 and len(ptext) < 110
+            if not (is_heading or tabbed or overlaps_link or contact or piped or mode == "frozen"):
                 if mode == "summary" and len(ptext) >= 40:
                     kind = "summary"
                 elif mode == "skills" and len(ptext) >= 25:
@@ -617,17 +673,87 @@ def _wrap(text, font, size, widths):
 # ----------------------------------------------------------------------------
 # Applying edits
 # ----------------------------------------------------------------------------
+def _norm_word(w: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", w.lower())
+
+
+def _line_rect(p, l, merged):
+    es = l.spans if merged and l is p.lines[0] else l.spans[l.lead:]
+    x0 = min(s.x0 for s in es) - 1
+    x1 = max(max(s.x1 for s in es) + 1, l.limit)
+    return pymupdf.Rect(x0, l.baseline - 0.72 * p.size, x1, l.baseline + 0.22 * p.size)
+
+
+def _render(pdf_bytes, plans):
+    """Redact the old text of the planned lines, then write the new text. Returns the doc."""
+    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    by_page = {}
+    for plan in plans:
+        by_page.setdefault(plan[0].page, []).append(plan)
+    for pno, items in by_page.items():
+        page = doc[pno]
+        for p, _f, _k, _pl, _xs, merged in items:
+            for l in p.lines:
+                try:
+                    page.add_redact_annot(_line_rect(p, l, merged), fill=False)
+                except Exception:
+                    page.add_redact_annot(_line_rect(p, l, merged))
+        page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
+                              graphics=pymupdf.PDF_REDACT_LINE_ART_NONE)
+    for pno, items in by_page.items():
+        page = doc[pno]
+        fm = FontManager(doc)
+        for p, font, _kind, (size, lines, _scale), xs, merged in items:
+            tw = pymupdf.TextWriter(page.rect)
+            if merged:
+                bf, _ = fm.get(p.font, p.flags, {"\u2022"})
+                glyph = "\u2022" if bf.has_glyph(0x2022) else "-"
+                tw.append(pymupdf.Point(p.lines[0].x_bullet, p.lines[0].baseline), glyph,
+                          font=bf, fontsize=size)
+            for i, txt in enumerate(lines):
+                tw.append(pymupdf.Point(xs[i], p.lines[i].baseline), txt, font=font,
+                          fontsize=size)
+            tw.write_text(page, color=pymupdf.sRGB_to_pdf(p.color))
+    return doc
+
+
+def _verify(doc, plans):
+    """Ids of paragraphs whose edited area still shows old text or overlapping words."""
+    bad = set()
+    for p, _font, _kind, (_size, lines, _scale), _xs, merged in plans:
+        page = doc[p.page]
+        expected = {_norm_word(w) for w in " ".join(lines).split()}
+        expected.discard("")
+        found = []
+        for l in p.lines:
+            r = _line_rect(p, l, merged)
+            r = pymupdf.Rect(l.x_text - 0.5 if not merged else r.x0, r.y0, r.x1, r.y1)
+            found += [(pymupdf.Rect(w[:4]), _norm_word(w[4])) for w in
+                      page.get_text("words", clip=r)]
+        for rect, word in found:
+            if word and word not in expected:
+                bad.add(p.id)                     # leftover of the old text
+        for i in range(len(found)):               # overlapping words
+            for j in range(i + 1, len(found)):
+                a, b = found[i][0], found[j][0]
+                inter = a & b
+                if inter.is_empty:
+                    continue
+                if inter.get_area() > 0.3 * min(a.get_area(), b.get_area()):
+                    bad.add(p.id)
+    return bad
+
+
 def apply_edits(pdf_bytes: bytes, resume: ResumeDoc, edits: dict,
                 linkedin_url: str = "", github_url: str = ""):
     """
     edits: {paragraph_id: new_text}
-    Returns (new_pdf_bytes, applied, skipped)
-    applied: [{id, old, new, font_kind, scale}], skipped: [{id, reason}]
+    Returns (new_pdf_bytes, applied, skipped, links_added)
     """
-    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-    fm = FontManager(doc)
+    doc0 = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    fm0 = FontManager(doc0)
     by_id = {p.id: p for p in resume.paragraphs}
-    applied, skipped, plans = [], [], []
+    skipped, plans = [], []
 
     for pid, new_text in edits.items():
         p = by_id.get(pid)
@@ -639,7 +765,7 @@ def apply_edits(pdf_bytes: bytes, resume: ResumeDoc, edits: dict,
         if not new_text or new_text == p.text:
             continue
         chars = {c for c in new_text if c.isalnum()}
-        font, kind = fm.get(p.font, p.flags, chars)
+        font, kind = fm0.get(p.font, p.flags, chars)
         if font is None:
             skipped.append({"id": pid, "reason": "font unavailable"})
             continue
@@ -651,7 +777,7 @@ def apply_edits(pdf_bytes: bytes, resume: ResumeDoc, edits: dict,
             if len(p.lines) > 1:
                 x_first = p.lines[1].x_text
             else:
-                x_first = p.lines[0].x_bullet + font.text_length("•  ", p.size)
+                x_first = p.lines[0].x_bullet + font.text_length("\u2022  ", p.size)
         xs = [x_first] + [l.x_text for l in p.lines[1:]]
         placed = None
         for scale in (1.0, 0.98, 0.96, 0.94, 0.92):
@@ -665,45 +791,28 @@ def apply_edits(pdf_bytes: bytes, resume: ResumeDoc, edits: dict,
             skipped.append({"id": pid, "reason": "new text did not fit in the original space"})
             continue
         plans.append((p, font, kind, placed, xs, merged))
+    doc0.close()
 
-    # 1) remove the old text of the lines we rewrite (keep graphics, images, links)
-    by_page = {}
-    for plan in plans:
-        by_page.setdefault(plan[0].page, []).append(plan)
-    for pno, items in by_page.items():
-        page = doc[pno]
-        for p, _f, _k, _pl, _xs, merged in items:
-            for l in p.lines:
-                es = l.spans if merged and l is p.lines[0] else l.spans[l.lead:]
-                if not es:
-                    continue
-                r = pymupdf.Rect(min(s.x0 for s in es) - 1, l.baseline - 0.70 * p.size,
-                                 max(s.x1 for s in es) + 1, l.baseline + 0.20 * p.size)
-                try:
-                    page.add_redact_annot(r, fill=False)
-                except Exception:
-                    page.add_redact_annot(r)
-        page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
-                              graphics=pymupdf.PDF_REDACT_LINE_ART_NONE)
+    excluded = set()
+    doc = None
+    for _attempt in range(3):
+        active = [pl for pl in plans if pl[0].id not in excluded]
+        doc = _render(pdf_bytes, active)
+        bad = _verify(doc, active)
+        if not bad:
+            break
+        excluded |= bad
+        doc.close()
+        doc = None
+    if doc is None:                                # give up: return the original untouched
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        excluded = {pl[0].id for pl in plans}
+    for pid in excluded:
+        skipped.append({"id": pid, "reason": "could not be edited cleanly, kept original"})
 
-    # 2) write the new text in the same place, font, size and colour
-    for pno, items in by_page.items():
-        page = doc[pno]
-        for p, font, kind, (size, lines, scale), xs, merged in items:
-            rgb = pymupdf.sRGB_to_pdf(p.color)
-            tw = pymupdf.TextWriter(page.rect)
-            if merged:
-                bf, _ = fm.get(p.font, p.flags, {"\u2022"})
-                glyph = "\u2022" if bf.has_glyph(0x2022) else "-"
-                tw.append(pymupdf.Point(p.lines[0].x_bullet, p.lines[0].baseline), glyph,
-                          font=bf, fontsize=size)
-            for i, txt in enumerate(lines):
-                tw.append(pymupdf.Point(xs[i], p.lines[i].baseline), txt, font=font,
-                          fontsize=size)
-            tw.write_text(page, color=rgb)
-            applied.append({"id": p.id, "old": p.text, "new": " ".join(lines),
-                            "font_kind": kind, "scale": scale, "section": p.section})
-
+    applied = [{"id": p.id, "old": p.text, "new": " ".join(lines), "font_kind": kind,
+                "scale": scale, "section": p.section}
+               for p, _f, kind, (_size, lines, scale), _xs, _m in plans if p.id not in excluded]
     links_added = ensure_links(doc, linkedin_url, github_url)
     out = doc.tobytes(garbage=3, deflate=True)
     doc.close()
